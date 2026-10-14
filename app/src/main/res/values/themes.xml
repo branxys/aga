@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PadRelay" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#16181D</item>
+        <item name="colorPrimaryDark">#0D0E11</item>
+        <item name="colorAccent">#5B8CFF</item>
+        <item name="colorControlActivated">#5B8CFF</item>
+        <item name="colorControlNormal">#8B91A1</item>
+        <item name="android:windowBackground">#0D0E11</item>
+        <item name="android:statusBarColor">#0D0E11</item>
+        <item name="android:navigationBarColor">#0D0E11</item>
+        <item name="android:textColor">#ECEEF2</item>
+    </style>
+</resources>
