@@ -6,7 +6,7 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.max
 
-data class AbsInfo(val min: Int, val max: Int)
+data class AbsInfo(val min: Int, val max: Int, val value: Int = 0) // value = resting value when scanned
 
 data class PadDevice(
     val path: String,
@@ -35,7 +35,7 @@ object Evdev {
     )
 
     private val sectionRe = Regex("""^\s*([A-Z]+)\s+\([0-9a-fA-F]+\):""")
-    private val absRe = Regex("""(ABS_\w+)\s*:\s*value\s+-?\d+,\s*min\s+(-?\d+),\s*max\s+(-?\d+)""")
+    private val absRe = Regex("""(ABS_\w+)\s*:\s*value\s+(-?\d+),\s*min\s+(-?\d+),\s*max\s+(-?\d+)""")
 
     private val SU_CANDIDATES = listOf(
         "su", "/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su",
@@ -131,7 +131,7 @@ object Evdev {
                 "KEY" -> if (line.split(Regex("\\s+")).any { it in GAMEPAD_KEYS }) hasPadKey = true
                 "ABS" -> absRe.find(line)?.let { m ->
                     val code = ABS_CODES[m.groupValues[1]]
-                    if (code != null) abs[code] = AbsInfo(m.groupValues[2].toInt(), m.groupValues[3].toInt())
+                    if (code != null) abs[code] = AbsInfo(m.groupValues[3].toInt(), m.groupValues[4].toInt(), m.groupValues[2].toInt())
                 }
             }
         }
@@ -170,13 +170,39 @@ class PadState(dev: PadDevice) {
     }
 
     private val abs = dev.abs
+    private val padName = dev.name
 
-    // Right stick is RX/RY if the pad has them, otherwise Z/RZ (generic HID pads)
-    private val hasRight = abs.containsKey(3) && abs.containsKey(4)
-    private val rsX = if (hasRight) 3 else 2
-    private val rsY = if (hasRight) 4 else 5
-    private val ltCode = if (hasRight && abs.containsKey(2)) 2 else if (abs.containsKey(10)) 10 else -1
-    private val rtCode = if (hasRight && abs.containsKey(5)) 5 else if (abs.containsKey(9)) 9 else -1
+    // Different controllers put the right stick and the triggers on different axes (Xbox pads use RX/RY for
+    // the stick, PlayStation pads use Z/RZ and put the triggers on RX/RY). So we look at where each axis
+    // rests when the controller is untouched: sticks rest in the middle of their range, triggers at the minimum.
+    private fun isCentered(c: Int): Boolean {
+        val i = abs[c] ?: return false
+        val center = (i.min + i.max) / 2f
+        val half = max((i.max - i.min) / 2f, 1f)
+        return kotlin.math.abs(i.value - center) <= half * 0.3f
+    }
+
+    private fun restsAtMin(c: Int): Boolean {
+        val i = abs[c] ?: return false
+        return (i.value - i.min).toFloat() <= max(i.max - i.min, 1) * 0.15f
+    }
+
+    private val rightPair: Pair<Int, Int> = when {
+        isCentered(3) && isCentered(4) -> 3 to 4
+        isCentered(2) && isCentered(5) -> 2 to 5
+        abs.containsKey(3) && abs.containsKey(4) -> 3 to 4
+        else -> 2 to 5
+    }
+    private val rsX = rightPair.first
+    private val rsY = rightPair.second
+
+    private fun pickTrigger(candidates: List<Int>): Int =
+        candidates.firstOrNull { abs.containsKey(it) && it != rsX && it != rsY && restsAtMin(it) }
+            ?: candidates.firstOrNull { abs.containsKey(it) && it != rsX && it != rsY }
+            ?: -1
+
+    private val ltCode = pickTrigger(listOf(2, 10, 3))
+    private val rtCode = pickTrigger(listOf(5, 9, 4))
 
     private var keyMask = 0
     private var hatX = 0
@@ -247,6 +273,6 @@ class PadState(dev: PadDevice) {
         raw.rtBtn = rtBtn
         raw.lx = lx; raw.ly = ly; raw.rx = rx; raw.ry = ry
         raw.lt = lt; raw.rt = rt
-        return Tuning.buildPacket(slot, raw, publish)
+        return Tuning.buildPacket(slot, raw, publish, padName)
     }
 }

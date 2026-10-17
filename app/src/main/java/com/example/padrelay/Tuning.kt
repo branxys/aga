@@ -7,6 +7,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.pow
+import java.util.concurrent.ConcurrentHashMap
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -36,6 +37,11 @@ class StickCfg {
         inner = 0.08f; outer = 1f; anti = 0f; curve = 1f
         invertX = false; invertY = false; radial = true
     }
+
+    fun copyFrom(o: StickCfg) {
+        inner = o.inner; outer = o.outer; anti = o.anti; curve = o.curve
+        invertX = o.invertX; invertY = o.invertY; radial = o.radial
+    }
 }
 
 class TriggerCfg {
@@ -44,6 +50,8 @@ class TriggerCfg {
     var curve = 1f
 
     fun reset() { start = 0f; end = 1f; curve = 1f }
+
+    fun copyFrom(o: TriggerCfg) { start = o.start; end = o.end; curve = o.curve }
 }
 
 class PadConfig {
@@ -55,6 +63,13 @@ class PadConfig {
 
     /** For each physical button (index into Tuning.BUTTON_NAMES): 0..14 = button, 15 = LT, 16 = RT, -1 = disabled. */
     val map = IntArray(15) { it }
+
+    fun copyFrom(o: PadConfig) {
+        left.copyFrom(o.left); right.copyFrom(o.right)
+        lt.copyFrom(o.lt); rt.copyFrom(o.rt)
+        swapSticks = o.swapSticks
+        for (i in map.indices) map[i] = o.map[i]
+    }
 
     fun resetAll() {
         left.reset(); right.reset(); lt.reset(); rt.reset()
@@ -72,7 +87,14 @@ object Live {
         val buttonsIn: Int, val buttonsOut: Int
     )
 
-    @Volatile var frame: Frame? = null
+    /** Latest frame per controller name, and the most recent frame from any controller. */
+    val frames = ConcurrentHashMap<String, Frame>()
+    @Volatile var last: Frame? = null
+
+    fun publish(name: String, f: Frame) {
+        frames[name] = f
+        last = f
+    }
 }
 
 object Tuning {
@@ -85,7 +107,22 @@ object Tuning {
         0x0010, 0x0020, 0x0400, 0x0001, 0x0002, 0x0004, 0x0008
     )
 
+    /** Default settings, used by every controller that has no profile of its own. */
     val cfg = PadConfig()
+
+    /** Per-controller settings, keyed by the controller's name. */
+    val profiles = ConcurrentHashMap<String, PadConfig>()
+
+    /** Which profile the Tune tab is editing right now (null = the default settings). */
+    @Volatile var editing: String? = null
+
+    fun cfgFor(name: String?): PadConfig = if (name == null) cfg else (profiles[name] ?: cfg)
+
+    /** The profile for this controller, created as a copy of the default settings the first time. */
+    fun ensureProfile(name: String?): PadConfig {
+        if (name == null) return cfg
+        return profiles.getOrPut(name) { PadConfig().also { it.copyFrom(cfg) } }
+    }
 
     private const val PREFS = "padrelay"
     private const val KEY = "tuning"
@@ -103,9 +140,9 @@ object Tuning {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, toJson().toString()).apply()
     }
 
-    fun applyPreset(name: String) {
-        val sticks = listOf(cfg.left, cfg.right)
-        val trigs = listOf(cfg.lt, cfg.rt)
+    fun applyPreset(target: PadConfig, name: String) {
+        val sticks = listOf(target.left, target.right)
+        val trigs = listOf(target.lt, target.rt)
         sticks.forEach { it.reset() }
         trigs.forEach { it.reset() }
         when (name) {
@@ -167,8 +204,8 @@ object Tuning {
      * magic(0xC8) slot buttons(u16) LT RT (u8) LX LY RX RY (s16), little endian.
      * publish = true also updates the live preview.
      */
-    fun buildPacket(slot: Int, raw: RawInput, publish: Boolean): ByteArray {
-        val c = cfg
+    fun buildPacket(slot: Int, raw: RawInput, publish: Boolean, name: String): ByteArray {
+        val c = cfgFor(name)
 
         var lx = raw.lx; var ly = raw.ly; var rx = raw.rx; var ry = raw.ry
         if (c.swapSticks) {
@@ -198,10 +235,10 @@ object Tuning {
         val rtOut = max(trigger(rtIn, c.rt), if (rtForce) 1f else 0f)
 
         if (publish) {
-            Live.frame = Live.Frame(
+            Live.publish(name, Live.Frame(
                 lx, ly, l[0], l[1], rx, ry, r[0], r[1],
                 ltIn, ltOut, rtIn, rtOut, raw.buttons, out
-            )
+            ))
         }
 
         return ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN).apply {
@@ -245,24 +282,44 @@ object Tuning {
         t.curve = o.optDouble("curve", t.curve.toDouble()).toFloat()
     }
 
-    private fun toJson(): JSONObject {
+    private fun cfgToJson(c: PadConfig): JSONObject {
         val arr = JSONArray()
-        cfg.map.forEach { arr.put(it) }
+        c.map.forEach { arr.put(it) }
         return JSONObject()
-            .put("l", stickJson(cfg.left)).put("r", stickJson(cfg.right))
-            .put("lt", trigJson(cfg.lt)).put("rt", trigJson(cfg.rt))
-            .put("swap", cfg.swapSticks).put("map", arr)
+            .put("l", stickJson(c.left)).put("r", stickJson(c.right))
+            .put("lt", trigJson(c.lt)).put("rt", trigJson(c.rt))
+            .put("swap", c.swapSticks).put("map", arr)
+    }
+
+    private fun cfgFromJson(o: JSONObject, c: PadConfig) {
+        stickLoad(o.optJSONObject("l"), c.left)
+        stickLoad(o.optJSONObject("r"), c.right)
+        trigLoad(o.optJSONObject("lt"), c.lt)
+        trigLoad(o.optJSONObject("rt"), c.rt)
+        c.swapSticks = o.optBoolean("swap", false)
+        val arr = o.optJSONArray("map")
+        if (arr != null && arr.length() == c.map.size) {
+            for (i in c.map.indices) c.map[i] = arr.optInt(i, i)
+        }
+    }
+
+    private fun toJson(): JSONObject {
+        val p = JSONObject()
+        for ((name, c) in profiles) p.put(name, cfgToJson(c))
+        return JSONObject().put("default", cfgToJson(cfg)).put("profiles", p)
     }
 
     private fun fromJson(o: JSONObject) {
-        stickLoad(o.optJSONObject("l"), cfg.left)
-        stickLoad(o.optJSONObject("r"), cfg.right)
-        trigLoad(o.optJSONObject("lt"), cfg.lt)
-        trigLoad(o.optJSONObject("rt"), cfg.rt)
-        cfg.swapSticks = o.optBoolean("swap", false)
-        val arr = o.optJSONArray("map")
-        if (arr != null && arr.length() == cfg.map.size) {
-            for (i in cfg.map.indices) cfg.map[i] = arr.optInt(i, i)
+        // older versions saved just the default settings at the top level
+        cfgFromJson(o.optJSONObject("default") ?: o, cfg)
+        val p = o.optJSONObject("profiles") ?: return
+        val keys = p.keys()
+        while (keys.hasNext()) {
+            val name = keys.next()
+            val sub = p.optJSONObject(name) ?: continue
+            val c = PadConfig()
+            cfgFromJson(sub, c)
+            profiles[name] = c
         }
     }
 }

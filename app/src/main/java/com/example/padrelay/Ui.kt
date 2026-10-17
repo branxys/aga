@@ -168,7 +168,8 @@ class StickPreview(ctx: Context, private val isLeftStick: Boolean) : View(ctx) {
     }
 
     override fun onDraw(canvas: Canvas) {
-        val c = if (isLeftStick) Tuning.cfg.left else Tuning.cfg.right
+        val cc = Tuning.cfgFor(Tuning.editing)
+        val c = if (isLeftStick) cc.left else cc.right
         val cx = width / 2f
         val cy = height / 2f
         val r = min(width, height) / 2f - Ui.dp(context, 6)
@@ -216,7 +217,8 @@ class BarPreview(ctx: Context, private val isLeftTrigger: Boolean) : View(ctx) {
     }
 
     override fun onDraw(canvas: Canvas) {
-        val c = if (isLeftTrigger) Tuning.cfg.lt else Tuning.cfg.rt
+        val cc = Tuning.cfgFor(Tuning.editing)
+        val c = if (isLeftTrigger) cc.lt else cc.rt
         val w = width.toFloat()
         val h = height.toFloat()
         val rad = h / 2f

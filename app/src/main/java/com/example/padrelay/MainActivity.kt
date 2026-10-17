@@ -35,7 +35,7 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 
 /** State of one controller in normal (non-root) mode. Each controller gets its own player slot (0..3). */
-private class AndroidPad(val slot: Int) {
+private class AndroidPad(val slot: Int, val name: String) {
     var keyMask = 0
     var hatMask = 0
     var ltKey = false
@@ -59,7 +59,7 @@ private class AndroidPad(val slot: Int) {
         raw.rtBtn = rtKey
         raw.lx = lx; raw.ly = ly; raw.rx = rx; raw.ry = ry
         raw.lt = lt; raw.rt = rt
-        return Tuning.buildPacket(slot, raw, publish)
+        return Tuning.buildPacket(slot, raw, publish, name)
     }
 }
 
@@ -109,6 +109,10 @@ class MainActivity : AppCompatActivity() {
     private val buttonLabels = ArrayList<TextView>()
     private val mapPills = ArrayList<TextView>()
     private val refreshers = ArrayList<() -> Unit>()
+    private lateinit var targetRow: LinearLayout
+    private lateinit var targetHint: TextView
+    private lateinit var resetProfilePill: TextView
+    private var targetNames: List<String> = emptyList()
 
     private val prefs by lazy { getSharedPreferences("padrelay", MODE_PRIVATE) }
     private val pct: (Float) -> String = { v -> "${(v * 100).toInt()}%" }
@@ -138,7 +142,9 @@ class MainActivity : AppCompatActivity() {
     private val ticker = object : Runnable {
         override fun run() {
             if (tab != 1) return
-            val f = Live.frame
+            val e = Tuning.editing
+            val f = if (e == null) Live.last else Live.frames[e]
+            if (Live.frames.keys.any { it !in targetNames }) rebuildTargets()
             if (f != null) {
                 leftPrev.set(f.inLx, f.inLy, f.outLx, f.outLy)
                 rightPrev.set(f.inRx, f.inRy, f.outRx, f.outRy)
@@ -270,7 +276,12 @@ class MainActivity : AppCompatActivity() {
         tunePage.visibility = if (i == 1) View.VISIBLE else View.GONE
         Ui.style(tabRelay, if (i == 0) Ui.SURFACE2 else Color.TRANSPARENT, if (i == 0) Ui.TEXT else Ui.MUTED)
         Ui.style(tabTune, if (i == 1) Ui.SURFACE2 else Color.TRANSPARENT, if (i == 1) Ui.TEXT else Ui.MUTED)
-        if (i == 1) startTicker() else stopTicker()
+        if (i == 1) {
+            rebuildTargets()
+            startTicker()
+        } else {
+            stopTicker()
+        }
     }
 
     // =====================================================================================
@@ -367,15 +378,38 @@ class MainActivity : AppCompatActivity() {
         val ctx = this
         val col = pageColumn()
 
+        // --- which controller is being edited ---
+        val editingCard = Ui.card(ctx)
+        editingCard.addView(Ui.text(ctx, "Settings for", 13f, Ui.MUTED))
+        targetRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        val targetScroll = HorizontalScrollView(ctx).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(targetRow)
+        }
+        editingCard.addView(targetScroll, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP).apply { topMargin = Ui.dp(ctx, 8) })
+        targetHint = Ui.text(ctx, "", 12f, Ui.MUTED)
+        editingCard.addView(targetHint, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP).apply { topMargin = Ui.dp(ctx, 10) })
+        resetProfilePill = Ui.pill(ctx, "Use default settings for this controller") {
+            val name = Tuning.editing
+            if (name != null) {
+                Tuning.profiles.remove(name)
+                saveTuning()
+                refreshers.forEach { it() }
+            }
+        }
+        editingCard.addView(resetProfilePill, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP).apply { topMargin = Ui.dp(ctx, 10) })
+        col.addView(editingCard)
+        rebuildTargets()
+
         // --- presets ---
         val presets = Ui.card(ctx)
         presets.addView(Ui.text(ctx, "Presets", 13f, Ui.MUTED))
         val prow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
         for (name in listOf("Default", "Drift fix", "Precise", "Snappy")) {
             val p = Ui.pill(ctx, name) {
-                Tuning.applyPreset(name)
+                Tuning.applyPreset(writeCfg(), name)
                 refreshers.forEach { it() }
-                Tuning.save(applicationContext)
+                saveTuning()
             }
             prow.addView(p, LinearLayout.LayoutParams(Ui.WRAP, Ui.WRAP).apply { rightMargin = Ui.dp(ctx, 8) })
         }
@@ -420,15 +454,24 @@ class MainActivity : AppCompatActivity() {
         )
         col.addView(live)
 
-        col.addView(stickCard("Left stick", Tuning.cfg.left))
-        col.addView(stickCard("Right stick", Tuning.cfg.right))
-        col.addView(triggerCard("Left trigger", Tuning.cfg.lt))
-        col.addView(triggerCard("Right trigger", Tuning.cfg.rt))
+        col.addView(stickCard("Left stick") { it.left })
+        col.addView(stickCard("Right stick") { it.right })
+        col.addView(triggerCard("Left trigger") { it.lt })
+        col.addView(triggerCard("Right trigger") { it.rt })
         col.addView(buttonsCard())
         return scroll(col)
     }
 
-    private fun saveTuning() = Tuning.save(applicationContext)
+    /** Settings being shown: the selected controller's profile, or the defaults. */
+    private fun readCfg(): PadConfig = Tuning.cfgFor(Tuning.editing)
+
+    /** Settings being changed: creates the controller's own profile the first time (a copy of the defaults). */
+    private fun writeCfg(): PadConfig = Tuning.ensureProfile(Tuning.editing)
+
+    private fun saveTuning() {
+        Tuning.save(applicationContext)
+        rebuildTargets()
+    }
 
     private fun addSlider(
         card: LinearLayout, label: String, lo: Float, hi: Float,
@@ -448,28 +491,91 @@ class MainActivity : AppCompatActivity() {
         refreshers.add { t.set(get()) }
     }
 
-    private fun stickCard(title: String, c: StickCfg): View {
+    private fun stickCard(title: String, sel: (PadConfig) -> StickCfg): View {
         val card = Ui.card(this)
         card.addView(Ui.text(this, title, 17f, Ui.TEXT, true))
-        addSlider(card, "Inner deadzone", 0f, 0.6f, { c.inner }, { c.inner = it }, pct)
-        addSlider(card, "Outer limit", 0.5f, 1f, { c.outer }, { c.outer = it }, pct)
-        addSlider(card, "Anti-deadzone", 0f, 0.5f, { c.anti }, { c.anti = it }, pct)
-        addSlider(card, "Response curve (below 1 snappy, above 1 precise)", 0.4f, 3f, { c.curve }, { c.curve = it }) {
-            String.format("%.2f", it)
-        }
-        addToggle(card, "Radial deadzone", "Off uses a square, per-axis deadzone", { c.radial }, { c.radial = it })
-        addToggle(card, "Invert X", null, { c.invertX }, { c.invertX = it })
-        addToggle(card, "Invert Y", null, { c.invertY }, { c.invertY = it })
+        addSlider(card, "Inner deadzone", 0f, 0.98f, { sel(readCfg()).inner }, { sel(writeCfg()).inner = it }, pct)
+        addSlider(card, "Outer limit", 0.1f, 1f, { sel(readCfg()).outer }, { sel(writeCfg()).outer = it }, pct)
+        addSlider(card, "Anti-deadzone", 0f, 0.5f, { sel(readCfg()).anti }, { sel(writeCfg()).anti = it }, pct)
+        addSlider(
+            card, "Response curve (below 1 snappy, above 1 precise)", 0.4f, 3f,
+            { sel(readCfg()).curve }, { sel(writeCfg()).curve = it }
+        ) { String.format("%.2f", it) }
+        addToggle(card, "Radial deadzone", "Off uses a square, per-axis deadzone",
+            { sel(readCfg()).radial }, { sel(writeCfg()).radial = it })
+        addToggle(card, "Invert X", null, { sel(readCfg()).invertX }, { sel(writeCfg()).invertX = it })
+        addToggle(card, "Invert Y", null, { sel(readCfg()).invertY }, { sel(writeCfg()).invertY = it })
         return card
     }
 
-    private fun triggerCard(title: String, c: TriggerCfg): View {
+    private fun triggerCard(title: String, sel: (PadConfig) -> TriggerCfg): View {
         val card = Ui.card(this)
         card.addView(Ui.text(this, title, 17f, Ui.TEXT, true))
-        addSlider(card, "Start (deadzone)", 0f, 0.6f, { c.start }, { c.start = it }, pct)
-        addSlider(card, "Max (counts as fully pressed)", 0.4f, 1f, { c.end }, { c.end = it }, pct)
-        addSlider(card, "Response curve", 0.4f, 3f, { c.curve }, { c.curve = it }) { String.format("%.2f", it) }
+        addSlider(card, "Start (deadzone)", 0f, 0.95f, { sel(readCfg()).start }, { sel(writeCfg()).start = it }, pct)
+        addSlider(card, "Max (counts as fully pressed)", 0.1f, 1f, { sel(readCfg()).end }, { sel(writeCfg()).end = it }, pct)
+        addSlider(
+            card, "Response curve", 0.4f, 3f,
+            { sel(readCfg()).curve }, { sel(writeCfg()).curve = it }
+        ) { String.format("%.2f", it) }
         return card
+    }
+
+    // ---------- per-controller selector ----------
+
+    /** Every controller we know about: connected, scanned in root mode, seen relaying, or with a saved profile. */
+    private fun knownControllers(): List<String> {
+        val names = linkedSetOf<String>()
+        for (id in InputDevice.getDeviceIds()) {
+            val d = InputDevice.getDevice(id) ?: continue
+            val pad = (d.sources and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+                (d.sources and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+            if (pad && !d.isVirtual && !Evdev.isCompanion(d.name)) names.add(d.name)
+        }
+        padChecks.forEach { names.add(it.tag as String) }
+        names.addAll(Tuning.profiles.keys)
+        names.addAll(Live.frames.keys)
+        return names.toList().sorted()
+    }
+
+    private fun rebuildTargets() {
+        val ctx = this
+        val names = knownControllers()
+        targetNames = names
+        val e = Tuning.editing
+        if (e != null && e !in names) {
+            Tuning.editing = null
+            refreshers.forEach { it() }
+        }
+        targetRow.removeAllViews()
+
+        fun add(label: String, value: String?) {
+            val selected = Tuning.editing == value
+            val p = Ui.pill(ctx, label, if (selected) Ui.ACCENT else Ui.SURFACE2, if (selected) Color.WHITE else Ui.TEXT) {
+                selectTarget(value)
+            }
+            p.textSize = 13f
+            targetRow.addView(p, LinearLayout.LayoutParams(Ui.WRAP, Ui.WRAP).apply { rightMargin = Ui.dp(ctx, 8) })
+        }
+        add("All controllers", null)
+        for (n in names) add(if (Tuning.profiles.containsKey(n)) "$n  \u2022" else n, n)
+        updateTargetHint()
+    }
+
+    private fun selectTarget(value: String?) {
+        Tuning.editing = value
+        rebuildTargets()
+        refreshers.forEach { it() }
+    }
+
+    private fun updateTargetHint() {
+        val name = Tuning.editing
+        val has = name != null && Tuning.profiles.containsKey(name)
+        targetHint.text = when {
+            name == null -> "Default settings. Used by every controller that has no profile of its own."
+            has -> "Custom profile for \"$name\"."
+            else -> "\"$name\" uses the default settings for now. Change any value to give it its own profile."
+        }
+        resetProfilePill.visibility = if (has) View.VISIBLE else View.GONE
     }
 
     private fun targetName(code: Int): String = when {
@@ -481,7 +587,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshMapPills() {
         for (i in mapPills.indices) {
-            val code = Tuning.cfg.map[i]
+            val code = readCfg().map[i]
             mapPills[i].text = targetName(code)
             Ui.style(mapPills[i], Ui.SURFACE2, if (code == i) Ui.MUTED else Ui.ACCENT)
         }
@@ -492,7 +598,7 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("${Tuning.BUTTON_NAMES[i]} acts as")
             .setItems(items.toTypedArray()) { _, which ->
-                Tuning.cfg.map[i] = if (which in 0..16) which else -1
+                writeCfg().map[i] = if (which in 0..16) which else -1
                 refreshMapPills()
                 saveTuning()
             }
@@ -508,7 +614,7 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP).apply { bottomMargin = Ui.dp(ctx, 4) }
         )
         addToggle(card, "Swap sticks", "Left stick controls right, and the other way round",
-            { Tuning.cfg.swapSticks }, { Tuning.cfg.swapSticks = it })
+            { readCfg().swapSticks }, { writeCfg().swapSticks = it })
 
         for (i in Tuning.BUTTON_NAMES.indices) {
             val row = LinearLayout(ctx).apply {
@@ -637,6 +743,7 @@ class MainActivity : AppCompatActivity() {
                         "Make sure your controllers are connected via Bluetooth, then scan again."
                 }
                 refreshButtons()
+                rebuildTargets()
             }
         }.start()
     }
@@ -737,7 +844,7 @@ class MainActivity : AppCompatActivity() {
     private fun padFor(deviceId: Int): AndroidPad? {
         pads[deviceId]?.let { return it }
         val slot = (0..3).firstOrNull { s -> pads.values.none { it.slot == s } } ?: return null
-        return AndroidPad(slot).also { pads[deviceId] = it }
+        return AndroidPad(slot, InputDevice.getDevice(deviceId)?.name ?: "Controller").also { pads[deviceId] = it }
     }
 
     private fun keyToBit(code: Int): Int = when (code) {
